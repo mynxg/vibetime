@@ -1,12 +1,9 @@
-name: CI
+name: Release SignPath
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -99,12 +96,9 @@ jobs:
           if-no-files-found: error
 
   package-windows:
-    name: Package Windows x64
+    name: Package and sign Windows x64
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
-    permissions:
-      actions: read
-      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -132,51 +126,83 @@ jobs:
       - name: Build Windows package
         run: pnpm --filter @vibetime/desktop dist:win
 
-      - name: Upload unsigned Windows artifacts
-        id: upload-unsigned-windows
-        uses: actions/upload-artifact@v4
-        with:
-          name: vibetime-windows-x64-unsigned
-          path: packages/desktop/release/*.exe
-          if-no-files-found: error
-
-      - name: Sign Windows artifacts with SignPath
-        uses: signpath/github-action-submit-signing-request@v2
-        with:
-          # GitHub repository secrets created from the SignPath organization/profile UI.
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
-
-          # SignPath project settings. The project slug must match the Project in SignPath.
-          # If the SignPath project is not named "vibetime", change this literal slug.
-          project-slug: vibetime-dev
-
-          # SignPath project slugs, stored as GitHub secrets so staging/release policies
-          # can be changed without editing the workflow.
-          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
-          artifact-configuration-slug: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
-
-          # This is produced by actions/upload-artifact above; no GitHub secret is needed.
-          github-artifact-id: ${{ steps.upload-unsigned-windows.outputs.artifact-id }}
-          wait-for-completion: true
-          output-artifact-directory: packages/desktop/release-signed
-
-          # Automatically provided by GitHub Actions. The job permissions above must allow
-          # actions: read and contents: read so SignPath can inspect and download artifacts.
-          github-token: ${{ github.token }}
-
-      - name: Verify signed Windows package assets
-        shell: bash
+      - name: Package unsigned Windows artifacts
+        shell: pwsh
         run: |
-          test -f packages/desktop/build/icon.ico
-          find packages/desktop/release-signed -maxdepth 1 -type f -name '*.exe' | grep -q .
+          $ErrorActionPreference = 'Stop'
+
+          $releaseDir = Resolve-Path 'packages/desktop/release'
+          $unsignedZip = Join-Path $releaseDir 'vibetime-windows-unsigned.zip'
+          $signedZip = Join-Path $releaseDir 'vibetime-windows-signed.zip'
+          $signedDir = Join-Path $releaseDir 'signed'
+
+          if (Test-Path $unsignedZip) { Remove-Item $unsignedZip -Force }
+          if (Test-Path $signedZip) { Remove-Item $signedZip -Force }
+          if (Test-Path $signedDir) { Remove-Item $signedDir -Recurse -Force }
+          New-Item -ItemType Directory -Path $signedDir -Force | Out-Null
+
+          Push-Location $releaseDir
+          try {
+            $exes = Get-ChildItem -File -Filter '*.exe' | Sort-Object Name
+            if (-not $exes) {
+              throw "No release .exe files found in $releaseDir"
+            }
+
+            Compress-Archive -Path $exes.Name -DestinationPath $unsignedZip -Force
+          } finally {
+            Pop-Location
+          }
+
+      - name: Install SignPath module
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name SignPath -MinimumVersion 4.0.0 -MaximumVersion 4.999.999 -Scope CurrentUser -Force -AllowClobber
+          Import-Module SignPath
+
+      - name: Submit signing request
+        shell: pwsh
+        env:
+          SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $releaseDir = Resolve-Path 'packages/desktop/release'
+          $unsignedZip = Join-Path $releaseDir 'vibetime-windows-unsigned.zip'
+          $signedZip = Join-Path $releaseDir 'vibetime-windows-signed.zip'
+
+          Submit-SigningRequest `
+            -InputArtifactPath $unsignedZip `
+            -ProjectSlug 'vibetime-dev' `
+            -SigningPolicySlug 'vibetime-dev' `
+            -ArtifactConfigurationSlug $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG `
+            -WaitForCompletion `
+            -WaitForCompletionTimeoutInSeconds 1800 `
+            -Force `
+            -OutputArtifactPath $signedZip `
+            -OrganizationId $env:SIGNPATH_ORGANIZATION_ID `
+            -ApiToken $env:SIGNPATH_API_TOKEN
+
+          Expand-Archive -Path $signedZip -DestinationPath (Join-Path $releaseDir 'signed') -Force
+
+      - name: Verify signed Windows artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signedDir = 'packages/desktop/release/signed'
+          Get-ChildItem $signedDir -File | Format-Table Name, Length
+          if (-not (Get-ChildItem $signedDir -Filter '*.exe' -File)) {
+            throw 'No signed release .exe files found.'
+          }
 
       - name: Upload signed Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vibetime-windows-x64
-          path: |
-            packages/desktop/release-signed/*.exe
+          path: packages/desktop/release/signed/*.exe
           if-no-files-found: error
 
   release:
