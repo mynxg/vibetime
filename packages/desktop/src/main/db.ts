@@ -1,14 +1,17 @@
 import { existsSync, type FSWatcher, mkdirSync, readFileSync, watch } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import type { NormalizedEvent } from '@vibetime/core'
 import {
-  allocateDurationByLocalDay,
+  buildHistorySummaryFromEvents,
   DDL_EVENTS,
   DDL_INDICES,
   DDL_OPEN_TURNS,
   durationWithinWindow,
-  resolveTurnInterval,
+  HISTORY_TURN_START_BUFFER_SEC,
+  type HistoryPeriodDays,
+  type HistorySummary,
+  historyLowerBound,
 } from '@vibetime/core'
 import { getManagedCliPath } from '@vibetime/hook/install'
 import Database from 'better-sqlite3'
@@ -17,29 +20,32 @@ import { formatDurationMinuteSummary } from '../shared/format.js'
 import type {
   ActiveTurn,
   AgentStatus,
-  HistorySummary,
   IpcPushEvent,
   MenubarState,
   TodayLiveState,
   TodaySummary,
 } from '../shared/ipc-types.js'
 import { findCodexTurnCompletion } from './codex-transcript.js'
+import { logger } from './logger.js'
 
 type DbEvent = Omit<NormalizedEvent, 'duration_sec' | 'meta'> & {
   duration_sec: number | null
   meta: Record<string, unknown> | string | null
 }
 
-type PeriodDays = 7 | 30 | 90 | 365
-
 const DB_PATH = join(homedir(), '.vibetime', 'data.db')
 const DB_DIR = join(homedir(), '.vibetime')
 const DB_FILES = new Set(['data.db', 'data.db-wal', 'data.db-shm'])
+
+// Background reconciliation cadence. Codex transcript fallbacks are best-effort;
+// 30s is fresh enough for UI without thrashing disk I/O.
+const RECONCILE_INTERVAL_MS = 30_000
 
 let db: Database.Database | null = null
 let dbWatcher: FSWatcher | null = null
 let notifyTimer: ReturnType<typeof setTimeout> | null = null
 let dbChangeListener: ((event: IpcPushEvent) => void) | null = null
+let reconcileTimer: ReturnType<typeof setInterval> | null = null
 
 export function setDbChangeListener(listener: ((event: IpcPushEvent) => void) | null): void {
   dbChangeListener = listener
@@ -115,6 +121,32 @@ export function writeAndNotify(fn: () => void): void {
   notifyRenderer()
 }
 
+function runReconcileOnce(): void {
+  try {
+    const handle = getDb()
+    reconcileCodexCompletedTurns(handle)
+    discardInactiveOpenTurns(handle)
+  } catch (err) {
+    // Reconcile is best-effort. A failure must not affect read paths or crash
+    // the main process — log and move on.
+    logger.error('reconcile loop failed', err)
+  }
+}
+
+export function startReconcileLoop(): void {
+  if (reconcileTimer) return
+  // Immediate kickoff so the first UI read after launch sees fresh data.
+  runReconcileOnce()
+  reconcileTimer = setInterval(runReconcileOnce, RECONCILE_INTERVAL_MS)
+}
+
+export function stopReconcileLoop(): void {
+  if (reconcileTimer) {
+    clearInterval(reconcileTimer)
+    reconcileTimer = null
+  }
+}
+
 function reconcileCodexCompletedTurns(db: Database.Database): void {
   const openTurns = db.prepare("SELECT * FROM open_turns WHERE agent = 'codex'").all() as Array<{
     turn_id: string
@@ -149,9 +181,12 @@ function reconcileCodexCompletedTurns(db: Database.Database): void {
         ts: completedAt,
         timezone: turn.timezone,
         duration_sec: Math.max(0, completedAt - turn.started_at),
+        // Store only the file basename so the local home path doesn't end up
+        // in db exports / shared diagnostics. The session_id + basename is
+        // enough to relocate the transcript under ~/.codex/sessions/.
         meta: JSON.stringify({
           reason: 'codex_task_complete_fallback',
-          transcript_path: transcriptPath,
+          transcript_file: basename(transcriptPath),
         }),
       })
       deleteOpenTurn.run(turn.turn_id)
@@ -276,274 +311,40 @@ function startOfLocalDay(date: Date): number {
   return Math.floor(new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime() / 1000)
 }
 
-function startOfLocalHour(date: Date): number {
-  return Math.floor(
-    new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours()).getTime() / 1000,
-  )
+// Single-pass scan of all events the History summary needs. Pulls everything
+// inside [lowerBound, rangeEnd) plus turn_start events from the buffer zone so
+// that turn_ends straddling the window edge can still be anchored by their
+// originating turn_start (see HISTORY_TURN_START_BUFFER_SEC).
+function queryEventsForHistory(
+  db: Database.Database,
+  rangeEnd: number,
+  periodDays: HistoryPeriodDays,
+): DbEvent[] {
+  const lowerBound = historyLowerBound(rangeEnd, periodDays)
+  return db
+    .prepare(`
+      SELECT * FROM events
+      WHERE ts < ?
+        AND (
+          ts >= ?
+          OR (event_type = 'turn_start' AND ts >= ?)
+        )
+      ORDER BY ts ASC
+    `)
+    .all(rangeEnd, lowerBound, lowerBound - HISTORY_TURN_START_BUFFER_SEC) as DbEvent[]
 }
 
-function toDateKey(ts: number): string {
-  return new Date(ts * 1000).toLocaleDateString('en-CA')
-}
-
-function weekdayIndex(ts: number): number {
-  const day = new Date(ts * 1000).getDay()
-  return day === 0 ? 6 : day - 1
-}
-
-function denseDateKeys(days: number, endDate: Date): string[] {
-  const endDay = startOfLocalDay(endDate)
-  const firstDay = endDay - (days - 1) * 86400
-  return Array.from({ length: days }, (_, index) => toDateKey(firstDay + index * 86400))
-}
-
-function queryEventsBefore(db: Database.Database, to: number): DbEvent[] {
-  return db.prepare('SELECT * FROM events WHERE ts < ? ORDER BY ts ASC').all(to) as DbEvent[]
-}
-
-function buildTurnStarts(events: DbEvent[]): Map<string, { ts: number }> {
-  const turnStarts = new Map<string, { ts: number }>()
-  for (const ev of events) {
-    if (ev.event_type === 'turn_start' && ev.turn_id) {
-      const existingStart = turnStarts.get(ev.turn_id)
-      if (!existingStart || ev.ts < existingStart.ts) {
-        turnStarts.set(ev.turn_id, { ts: ev.ts })
-      }
-    }
-  }
-  return turnStarts
-}
-
-function completedTurnEventsInWindow(events: DbEvent[], from: number, to: number): DbEvent[] {
-  return events.filter((ev) => ev.event_type === 'turn_end' && ev.ts >= from && ev.ts < to)
-}
-
-function allocateDurationByLocalHour(input: {
-  endTs: number
-  durationSec: number | null
-  startTs?: number
-  rangeStart: number
-  rangeEnd: number
-}): Array<{ hourStart: number; duration: number }> {
-  const interval = resolveTurnInterval(input)
-  if (!interval) return []
-
-  const start = Math.max(interval.start, input.rangeStart)
-  const end = Math.min(interval.end, input.rangeEnd)
-  if (end <= start) return []
-
-  const allocations: Array<{ hourStart: number; duration: number }> = []
-  let cursor = start
-
-  while (cursor < end) {
-    const hourStart = startOfLocalHour(new Date(cursor * 1000))
-    const nextHour = hourStart + 3600
-    const segmentEnd = Math.min(end, nextHour)
-    allocations.push({ hourStart, duration: segmentEnd - cursor })
-    cursor = segmentEnd
-  }
-
-  return allocations
-}
-
-export function buildHistorySummaryFromEvents(
-  events: DbEvent[],
-  options: { periodDays: PeriodDays; now?: Date },
-): HistorySummary {
-  const now = options.now ?? new Date()
-  const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
-  const rangeEnd = startOfLocalDay(tomorrow)
-  const calendarStart = rangeEnd - 365 * 86400
-  const periodStart = rangeEnd - options.periodDays * 86400
-  const turnStarts = buildTurnStarts(events)
-  const calendarTotals = new Map(denseDateKeys(365, now).map((date) => [date, 0]))
-  const periodProjectTotals = new Map<string, number>()
-  const trendProjectDayTotals = new Map<string, Map<string, number>>()
-  const hourlyTotals = new Map<string, number>()
-  const projectAgentTotals = new Map<
-    string,
-    { project: string; total: number; agents: Map<string, { total: number; turns: Set<string> }> }
-  >()
-  const turnDurations: Array<{
-    project: string
-    agent: string
-    turnId: string | null
-    startedAt: number
-    endedAt: number
-    duration: number
-  }> = []
-  const topProjectRows = new Map<
-    string,
-    { project: string; total: number; turns: Set<string>; lastActive: number | null }
-  >()
-  let currentPeriodTotal = 0
-  let previousPeriodTotal = 0
-  const previousPeriodStart = periodStart - options.periodDays * 86400
-
-  for (const ev of completedTurnEventsInWindow(events, calendarStart, rangeEnd)) {
-    if (isUnknownDurationEnd(ev)) continue
-
-    const allocations = allocateDurationByLocalDay({
-      endTs: ev.ts,
-      durationSec: ev.duration_sec,
-      startTs: ev.turn_id ? turnStarts.get(ev.turn_id)?.ts : undefined,
-      rangeStart: calendarStart,
-      rangeEnd,
-    })
-
-    for (const allocation of allocations) {
-      calendarTotals.set(
-        allocation.day,
-        (calendarTotals.get(allocation.day) ?? 0) + allocation.duration,
-      )
-    }
-
-    const periodDuration = completedDuration(ev, turnStarts, periodStart, rangeEnd)
-    if (periodDuration === null || periodDuration <= 0) continue
-
-    currentPeriodTotal += periodDuration
-    periodProjectTotals.set(ev.project, (periodProjectTotals.get(ev.project) ?? 0) + periodDuration)
-
-    let row = topProjectRows.get(ev.project)
-    if (!row) {
-      row = { project: ev.project, total: 0, turns: new Set(), lastActive: null }
-      topProjectRows.set(ev.project, row)
-    }
-    row.total += periodDuration
-    if (ev.turn_id) row.turns.add(ev.turn_id)
-    row.lastActive = Math.max(row.lastActive ?? 0, ev.ts)
-
-    let projectAgent = projectAgentTotals.get(ev.project)
-    if (!projectAgent) {
-      projectAgent = { project: ev.project, total: 0, agents: new Map() }
-      projectAgentTotals.set(ev.project, projectAgent)
-    }
-    projectAgent.total += periodDuration
-    const agent = projectAgent.agents.get(ev.agent) ?? { total: 0, turns: new Set<string>() }
-    agent.total += periodDuration
-    if (ev.turn_id) agent.turns.add(ev.turn_id)
-    projectAgent.agents.set(ev.agent, agent)
-
-    const startedAt = ev.turn_id
-      ? (turnStarts.get(ev.turn_id)?.ts ?? ev.ts - periodDuration)
-      : ev.ts - periodDuration
-    turnDurations.push({
-      project: ev.project,
-      agent: ev.agent,
-      turnId: ev.turn_id ?? null,
-      startedAt,
-      endedAt: ev.ts,
-      duration: periodDuration,
-    })
-
-    for (const allocation of allocateDurationByLocalHour({
-      endTs: ev.ts,
-      durationSec: ev.duration_sec,
-      startTs: ev.turn_id ? turnStarts.get(ev.turn_id)?.ts : undefined,
-      rangeStart: periodStart,
-      rangeEnd,
-    })) {
-      const key = `${weekdayIndex(allocation.hourStart)}:${new Date(allocation.hourStart * 1000).getHours()}`
-      hourlyTotals.set(key, (hourlyTotals.get(key) ?? 0) + allocation.duration)
-    }
-  }
-
-  for (const ev of completedTurnEventsInWindow(events, previousPeriodStart, periodStart)) {
-    const duration = completedDuration(ev, turnStarts, previousPeriodStart, periodStart)
-    if (duration === null || duration <= 0) continue
-    previousPeriodTotal += duration
-  }
-
-  const topProjects = [...periodProjectTotals.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .slice(0, 5)
-    .map(([project]) => project)
-  const topProjectSet = new Set(topProjects)
-  const hasOthers = [...periodProjectTotals.keys()].some((project) => !topProjectSet.has(project))
-  const trendProjects = hasOthers ? [...topProjects, 'Others'] : topProjects
-
-  for (const date of denseDateKeys(options.periodDays, now)) {
-    trendProjectDayTotals.set(date, new Map(trendProjects.map((project) => [project, 0])))
-  }
-
-  for (const ev of completedTurnEventsInWindow(events, periodStart, rangeEnd)) {
-    if (isUnknownDurationEnd(ev)) continue
-
-    const allocations = allocateDurationByLocalDay({
-      endTs: ev.ts,
-      durationSec: ev.duration_sec,
-      startTs: ev.turn_id ? turnStarts.get(ev.turn_id)?.ts : undefined,
-      rangeStart: periodStart,
-      rangeEnd,
-    })
-    const bucket = topProjectSet.has(ev.project) ? ev.project : 'Others'
-    if (!trendProjects.includes(bucket)) continue
-
-    for (const allocation of allocations) {
-      const day = trendProjectDayTotals.get(allocation.day)
-      if (!day) continue
-      day.set(bucket, (day.get(bucket) ?? 0) + allocation.duration)
-    }
-  }
-
-  return {
-    periodDays: options.periodDays,
-    calendar: [...calendarTotals.entries()].map(([date, total]) => ({ date, total })),
-    trendProjects,
-    trends: [...trendProjectDayTotals.entries()].map(([date, projects]) => ({
-      date,
-      projects: Object.fromEntries(projects),
-    })),
-    topProjects: [...topProjectRows.values()]
-      .sort((a, b) => b.total - a.total || a.project.localeCompare(b.project))
-      .map((row) => ({
-        project: row.project,
-        total: row.total,
-        turns: row.turns.size,
-        lastActive: row.lastActive,
-      })),
-    hourlyMatrix: Array.from({ length: 7 }, (_, weekday) =>
-      Array.from({ length: 24 }, (_, hour) => ({
-        weekday,
-        hour,
-        total: hourlyTotals.get(`${weekday}:${hour}`) ?? 0,
-      })),
-    ).flat(),
-    turnDurations: turnDurations.sort((a, b) => a.endedAt - b.endedAt),
-    projectAgentTotals: [...projectAgentTotals.values()]
-      .sort((a, b) => b.total - a.total || a.project.localeCompare(b.project))
-      .map((project) => ({
-        project: project.project,
-        total: project.total,
-        agents: [...project.agents.entries()]
-          .sort((a, b) => b[1].total - a[1].total || a[0].localeCompare(b[0]))
-          .map(([agent, data]) => ({
-            agent,
-            total: data.total,
-            turns: data.turns.size,
-          })),
-      })),
-    periodCompare: {
-      currentTotal: currentPeriodTotal,
-      previousTotal: previousPeriodTotal,
-      delta: currentPeriodTotal - previousPeriodTotal,
-      deltaRatio:
-        previousPeriodTotal > 0
-          ? (currentPeriodTotal - previousPeriodTotal) / previousPeriodTotal
-          : null,
-    },
-  }
-}
-
-export function queryHistorySummary(options: { periodDays: PeriodDays }): HistorySummary {
+export function queryHistorySummary(options: { periodDays: HistoryPeriodDays }): HistorySummary {
   const db = getDb()
-  reconcileCodexCompletedTurns(db)
-  discardInactiveOpenTurns(db)
+  // Reconcile runs on a background tick (see startReconcileLoop). Read paths
+  // stay pure — no file I/O, no writes — so opening History never blocks on
+  // transcript scanning.
 
   return db.transaction(() => {
     const now = new Date()
     const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
-    const events = queryEventsBefore(db, startOfLocalDay(tomorrow))
+    const rangeEnd = startOfLocalDay(tomorrow)
+    const events = queryEventsForHistory(db, rangeEnd, options.periodDays)
     return buildHistorySummaryFromEvents(events, { periodDays: options.periodDays, now })
   })()
 }
@@ -649,8 +450,8 @@ function queryActiveTurns(db: Database.Database): ActiveTurn[] {
 
 export function queryTodayLiveState(): TodayLiveState {
   const db = getDb()
-  reconcileCodexCompletedTurns(db)
-  discardInactiveOpenTurns(db)
+  // Reconcile runs on a background tick (see startReconcileLoop). Read paths
+  // stay pure so the menubar / today view never block on file I/O.
 
   return db.transaction(() => {
     const serverNow = Date.now() / 1000

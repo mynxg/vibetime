@@ -17,7 +17,7 @@ where did my agent-assisted work time go today?
 - Provides history views with contribution-style heatmaps and useful project breakdowns.
 - Installs and removes hooks for Claude Code, Codex, Cursor, and Gemini CLI from the app settings.
 - Keeps data on your machine. No account, cloud sync, or hosted backend is required.
-- Ships a small CLI through `~/.vibetime/bin/vibetime` for local checks and exports.
+- Ships a small CLI through `~/.vibetime/bin/vibetime` for local checks, exports, and hook health diagnostics.
 
 ## Download
 
@@ -74,10 +74,25 @@ VibeTime stores data under:
 
 - `~/.vibetime/data.db`
 - `~/.vibetime/config.toml`
+- `~/.vibetime/hook.log`
+- `~/.vibetime/main.log`
+- `~/.vibetime/hook-health.json`
 - `~/.vibetime/bin/vibetime`
 
 The database is local SQLite. You can remove VibeTime's hooks from Settings before
 uninstalling the app.
+
+Hook health diagnostics:
+
+- Run `vibetime health` to inspect recent hook persist failures.
+- Use this when data appears missing to quickly confirm whether writes are failing (for example, DB lock or disk issues).
+
+CLI essentials:
+
+- Run `vibetime status` for a compact local health summary.
+- Run `vibetime agents` to inspect agent hook installation.
+- Run `vibetime history` for the same 30-day summary semantics as the app History tab.
+- Add `--json` to status/query commands when scripting or calling from another agent.
 
 ## Development
 

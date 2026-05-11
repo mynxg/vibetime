@@ -4,16 +4,20 @@ import type {
   AppPreferences,
   AppUpdateState,
   CliInstallStatus,
+  HistoryPeriodDays,
   HistorySummary,
   IpcPushEvent,
+  IpcResult,
   MenubarState,
   TodayLiveState,
 } from '../../shared/ipc-types'
 
 export const store = createStore()
 
+type HistorySummaryCache = Partial<Record<HistoryPeriodDays, HistorySummary>>
+
 export const todayLiveStateAtom = atom<TodayLiveState | null>(null)
-export const historySummaryAtom = atom<HistorySummary | null>(null)
+export const historySummariesAtom = atom<HistorySummaryCache>({})
 export const menubarStateAtom = atom<MenubarState | null>(null)
 export const appPreferencesAtom = atom<AppPreferences | null>(null)
 export const agentStatusAtom = atom<AgentStatus[] | null>(null)
@@ -21,7 +25,8 @@ export const cliStatusAtom = atom<CliInstallStatus | null>(null)
 export const updateStateAtom = atom<AppUpdateState | null>(null)
 
 let refreshSeq = 0
-let historyRefreshSeq = 0
+const historyRefreshSeqByPeriod = new Map<HistoryPeriodDays, number>()
+let activeHistoryPeriod: HistorySummary['periodDays'] | null = null
 let menubarRefreshSeq = 0
 let appPreferencesRefreshSeq = 0
 let agentStatusRefreshSeq = 0
@@ -76,18 +81,33 @@ export async function refreshTodayLiveState(): Promise<void> {
   }
 }
 
+export function clearActiveHistoryPeriod(): void {
+  activeHistoryPeriod = null
+}
+
+function setHistorySummary(next: HistorySummary): void {
+  store.set(historySummariesAtom, {
+    ...store.get(historySummariesAtom),
+    [next.periodDays]: next,
+  })
+}
+
 export async function refreshHistorySummary(
   periodDays: HistorySummary['periodDays'],
-): Promise<void> {
-  const seq = ++historyRefreshSeq
+): Promise<IpcResult<HistorySummary> | null> {
+  activeHistoryPeriod = periodDays
+  const seq = (historyRefreshSeqByPeriod.get(periodDays) ?? 0) + 1
+  historyRefreshSeqByPeriod.set(periodDays, seq)
   try {
     const result = await window.api.invoke('getHistorySummary', { periodDays })
-    if (seq !== historyRefreshSeq) return
+    if (seq !== historyRefreshSeqByPeriod.get(periodDays)) return null
     if (result.ok) {
-      store.set(historySummaryAtom, result.data)
+      setHistorySummary(result.data)
     }
+    return result
   } catch {
     // Page-level queries surface initial load errors; push refresh is best-effort.
+    return null
   }
 }
 
@@ -183,6 +203,11 @@ export function handlePush(event: IpcPushEvent): void {
   if (event.type === 'db-changed') {
     void refreshTodayLiveState()
     void refreshMenubarState()
+    // Incremental history refresh only after the History view has loaded once.
+    // This avoids extra IPC work for users who never open History.
+    if (activeHistoryPeriod !== null && Object.keys(store.get(historySummariesAtom)).length > 0) {
+      void refreshHistorySummary(activeHistoryPeriod)
+    }
     return
   }
   if (event.type === 'update-state-changed') {
