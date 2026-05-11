@@ -149,7 +149,7 @@ jobs:
 
           # SignPath project settings. The project slug must match the Project in SignPath.
           # If the SignPath project is not named "vibetime", change this literal slug.
-          project-slug: vibetime
+          project-slug: vibetime-dev
 
           # SignPath project slugs, stored as GitHub secrets so staging/release policies
           # can be changed without editing the workflow.
