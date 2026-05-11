@@ -102,6 +102,9 @@ jobs:
     name: Package Windows x64
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -129,19 +132,51 @@ jobs:
       - name: Build Windows package
         run: pnpm --filter @vibetime/desktop dist:win
 
-      - name: Verify Windows package assets
+      - name: Upload unsigned Windows artifacts
+        id: upload-unsigned-windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibetime-windows-x64-unsigned
+          path: packages/desktop/release/*.exe
+          if-no-files-found: error
+
+      - name: Sign Windows artifacts with SignPath
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          # GitHub repository secrets created from the SignPath organization/profile UI.
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+
+          # SignPath project settings. The project slug must match the Project in SignPath.
+          # If the SignPath project is not named "vibetime", change this literal slug.
+          project-slug: vibetime
+
+          # SignPath project slugs, stored as GitHub secrets so staging/release policies
+          # can be changed without editing the workflow.
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+
+          # This is produced by actions/upload-artifact above; no GitHub secret is needed.
+          github-artifact-id: ${{ steps.upload-unsigned-windows.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: packages/desktop/release-signed
+
+          # Automatically provided by GitHub Actions. The job permissions above must allow
+          # actions: read and contents: read so SignPath can inspect and download artifacts.
+          github-token: ${{ github.token }}
+
+      - name: Verify signed Windows package assets
         shell: bash
         run: |
           test -f packages/desktop/build/icon.ico
-          test -f packages/desktop/release/win-unpacked/resources/bin/vibetime.exe
-          test ! -f packages/desktop/release/win-unpacked/resources/bin/vibetime-hook.exe
+          find packages/desktop/release-signed -maxdepth 1 -type f -name '*.exe' | grep -q .
 
-      - name: Upload Windows artifacts
+      - name: Upload signed Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vibetime-windows-x64
           path: |
-            packages/desktop/release/*.exe
+            packages/desktop/release-signed/*.exe
           if-no-files-found: error
 
   release:
