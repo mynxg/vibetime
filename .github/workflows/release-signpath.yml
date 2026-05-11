@@ -166,7 +166,6 @@ jobs:
         env:
           SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -178,7 +177,6 @@ jobs:
             -InputArtifactPath $unsignedZip `
             -ProjectSlug 'vibetime-dev' `
             -SigningPolicySlug 'vibetime-dev' `
-            -ArtifactConfigurationSlug $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG `
             -WaitForCompletion `
             -WaitForCompletionTimeoutInSeconds 1800 `
             -Force `
